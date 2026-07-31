@@ -42,10 +42,14 @@ jobs:
 
       - name: Build e Push da imagem
         run: |
-          IMAGE=${{ env.REGISTRY }}/${{ secrets.MGC_REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:latest
+          BASE=${{ env.REGISTRY }}/${{ secrets.MGC_REGISTRY_NAME }}/${{ env.IMAGE_NAME }}
 
-          docker build -t $IMAGE .
-          docker push $IMAGE
+          docker build \
+            -t $BASE:${{ github.sha }} \
+            -t $BASE:latest .
+
+          docker push $BASE:${{ github.sha }}
+          docker push $BASE:latest
 
       - name: Configurar kubectl
         run: |

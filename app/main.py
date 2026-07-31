@@ -1,7 +1,11 @@
+import time
+import logging
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, status, Depends
+import structlog
+from fastapi import FastAPI, HTTPException, Request, status, Depends
 from pydantic import BaseModel
+from prometheus_fastapi_instrumentator import Instrumentator
 from scalar_fastapi import get_scalar_api_reference
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -11,6 +15,35 @@ from app.models import Base, Order, Item
 
 Base.metadata.create_all(bind=engine)
 
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+_formatter = structlog.stdlib.ProcessorFormatter(
+    processor=structlog.processors.JSONRenderer(),
+    foreign_pre_chain=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+    ],
+)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_formatter)
+
+logging.root.setLevel(logging.INFO)
+logging.root.handlers = [_handler]
+
+logger = structlog.get_logger()
+
 app = FastAPI(
     title="API de Pedidos",
     description="Projeto base do curso Move Tech — Magalu × Prósper Digital Skills",
@@ -18,6 +51,25 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+
+Instrumentator().instrument(app).expose(app)
+
+
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    request_id = str(uuid4())
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - start) * 1000)
+    logger.info(
+        "request",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+    )
+    return response
 
 
 @app.get("/docs", include_in_schema=False)
@@ -58,12 +110,25 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok" if db_status == "ok" else "degraded", "database": db_status}
 
 
+@app.get("/stats", tags=["health"])
+def stats(db: Session = Depends(get_db)):
+    total = db.query(Order).count()
+    open_orders = db.query(Order).filter(Order.status == "open").count()
+    cancelled = db.query(Order).filter(Order.status == "cancelled").count()
+    total_items = db.query(Item).count()
+    return {
+        "orders": {"total": total, "open": open_orders, "cancelled": cancelled},
+        "items": {"total": total_items},
+    }
+
+
 @app.post("/orders", status_code=status.HTTP_201_CREATED, tags=["orders"])
 def create_order(body: OrderIn, db: Session = Depends(get_db)):
     order = Order(id=str(uuid4()), customer=body.customer)
     db.add(order)
     db.commit()
     db.refresh(order)
+    logger.info("order_created", order_id=order.id, customer=order.customer)
     return order_to_dict(order)
 
 
